@@ -127,13 +127,36 @@
   }
 
   .screen-container {
+    --screen-padding: 6px;
     background: var(--screen-bg);
     border-radius: 10px;
-    padding: 6px;
+    padding: var(--screen-padding);
     box-shadow:
       inset 0 3px 10px rgba(0,0,0,0.2),
       inset 0 1px 3px rgba(0,0,0,0.15);
     position: relative;
+  }
+
+  .cursor-overlay {
+    position: absolute;
+    inset: var(--screen-padding);
+    pointer-events: none;
+    z-index: 1;
+    display: none;
+  }
+
+  .cursor-overlay.show {
+    display: block;
+  }
+
+  .cursor-pixel {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: calc(100% / 128);
+    height: calc(100% / 128);
+    background: #ffffff;
+    transform: translate3d(0, 0, 0);
   }
 
   canvas {
@@ -143,6 +166,8 @@
     image-rendering: pixelated;
     image-rendering: crisp-edges;
     background: var(--screen-bg);
+    touch-action: none;
+    cursor: crosshair;
   }
 
   /* pen state indicator */
@@ -161,6 +186,7 @@
     color: white;
     backdrop-filter: blur(4px);
     transition: opacity 0.2s;
+    z-index: 2;
   }
   .pen-dot {
     width: 8px; height: 8px;
@@ -324,6 +350,16 @@
     gap: 8px;
     flex-wrap: wrap;
   }
+  .sim-toggle-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    color: #ddd;
+  }
+  .sim-toggle-row input {
+    width: 14px;
+    height: 14px;
+  }
   .sim-btn {
     background: #444;
     border: 1px solid #555;
@@ -337,6 +373,14 @@
   }
   .sim-btn:hover { background: #555; }
   .sim-btn:active { background: var(--etch-red); }
+  .sim-btn:disabled,
+  .sim-input:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .sim-btn:disabled:hover {
+    background: #444;
+  }
 
   .sim-info {
     color: #777;
@@ -385,6 +429,9 @@
     <div class="etch-label"><span>Etch-a-Sketch</span></div>
     <div class="screen-container">
       <canvas id="canvas" width="128" height="128"></canvas>
+      <div class="cursor-overlay" id="cursorOverlay">
+        <div class="cursor-pixel" id="cursorPixel"></div>
+      </div>
       <div class="pen-indicator">
         <div class="pen-dot up" id="penDot"></div>
         <span id="penLabel">PEN UP</span>
@@ -424,17 +471,16 @@
 
   <!-- Connection Status -->
   <div class="status-bar">
-    <div class="status-dot" id="statusDot"></div>
+    <div class="status-dot error" id="statusDot"></div>
     <span id="statusText">Disconnected</span>
   </div>
 
-  <!-- Simulation Controls -->
+  <!-- Viewer and Simulation Controls -->
   <details class="sim-controls">
-    <summary>🔧 Simulation & Debug Controls</summary>
+    <summary>Viewer & Simulation Controls</summary>
     <div class="sim-inner">
       <div class="sim-info">
-        No ESP32 connected? Use these to test the UI.<br>
-        Or connect via WebSocket at <b>ws://&lt;ESP32_IP&gt;/ws</b>
+        Connect to ESP32 for read-only live viewing, or enable local simulation to test the UI without hardware.
       </div>
 
       <div class="sim-input-row">
@@ -443,12 +489,17 @@
         <button class="sim-btn" id="connectBtn">Connect</button>
       </div>
 
-      <div class="sim-row">
-        <button class="sim-btn" id="simDrawBtn">▶ Sim: Draw Shape</button>
-        <button class="sim-btn" id="simPromptBtn">📝 Sim: New Prompt</button>
-        <button class="sim-btn" id="simSubmitCorrectBtn">✅ Sim: Correct</button>
-        <button class="sim-btn" id="simSubmitWrongBtn">❌ Sim: Wrong</button>
-        <button class="sim-btn" id="simClearBtn">🗑 Sim: Clear</button>
+      <label class="sim-toggle-row">
+        <input type="checkbox" id="simModeToggle" />
+        Enable local simulation
+      </label>
+
+      <div class="sim-row" id="simActions" hidden>
+        <button class="sim-btn" id="simPromptBtn" disabled>Sim: New Prompt</button>
+        <button class="sim-btn" id="simDrawBtn" disabled>Sim: Draw Shape</button>
+        <button class="sim-btn" id="simSubmitCorrectBtn" disabled>Sim: Correct</button>
+        <button class="sim-btn" id="simSubmitWrongBtn" disabled>Sim: Wrong</button>
+        <button class="sim-btn" id="simClearBtn" disabled>Sim: Clear</button>
       </div>
     </div>
   </details>
@@ -458,29 +509,53 @@
   // ============================================================
   //  CONFIG
   // ============================================================
-  const GRID = 128;
+  const GRID_WIDTH = 128;
+  const GRID_HEIGHT = 128;
+  const WS_SUBPROTOCOL = 'etchsketch.v1.json';
+  const RESYNC_RETRY_MS = 500;
+  const HEARTBEAT_INTERVAL_MS = 2000;
+  const HEARTBEAT_TIMEOUT_MS = 6000;
+  const SIM_FRAME_BYTE_COUNT = (GRID_WIDTH * GRID_HEIGHT + 7) >> 3;
+  const SCREEN_BG = '#c8c8b4';
+  const SCREEN_LINE = '#2a2a2a';
 
   // ============================================================
   //  CANVAS SETUP
   // ============================================================
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#c8c8b4'; // match screen bg
-  ctx.fillRect(0, 0, GRID, GRID);
+  const cursorOverlay = document.getElementById('cursorOverlay');
+  const cursorPixel = document.getElementById('cursorPixel');
+  canvas.width = GRID_WIDTH;
+  canvas.height = GRID_HEIGHT;
+  ctx.fillStyle = SCREEN_BG;
+  ctx.fillRect(0, 0, GRID_WIDTH, GRID_HEIGHT);
 
   let lastX = null, lastY = null;
+  let cursorX = null, cursorY = null;
   let penDown = false;
+  let lastSeq = null;
+  let appPhase = 'waiting_for_prompt';
+  let resyncRetryTimer = null;
+  let heartbeatTimer = null;
+  let lastHeartbeatRxAt = 0;
+  let simModeEnabled = false;
+  let simSeq = 0;
+  let simPrompt = '';
+  let simRunId = 0;
+  const simFrame = new Uint8Array(SIM_FRAME_BYTE_COUNT);
 
   // ============================================================
   //  DRAWING HELPERS
   // ============================================================
   function setPixel(x, y) {
-    if (x < 0 || x >= GRID || y < 0 || y >= GRID) return;
-    ctx.fillStyle = '#2a2a2a';
+    if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return;
+    ctx.fillStyle = SCREEN_LINE;
     ctx.fillRect(x, y, 1, 1);
   }
 
-  // Bresenham's line algorithm — fills gaps when packets skip pixels
+  // Browser fast path: Bresenham fills gaps immediately for low-latency display.
+  // The ESP32 maintains its own authoritative framebuffer for AI submit snapshots.
   function drawLine(x0, y0, x1, y1) {
     const dx = Math.abs(x1 - x0);
     const dy = Math.abs(y1 - y0);
@@ -498,10 +573,103 @@
   }
 
   function clearCanvas() {
-    ctx.fillStyle = '#c8c8b4';
-    ctx.fillRect(0, 0, GRID, GRID);
+    ctx.fillStyle = SCREEN_BG;
+    ctx.fillRect(0, 0, GRID_WIDTH, GRID_HEIGHT);
     lastX = null;
     lastY = null;
+  }
+
+  function clampCoord(value, max) {
+    return Math.max(0, Math.min(max - 1, Number(value) || 0));
+  }
+
+  function setCursorVisible(visible) {
+    if (!cursorOverlay) return;
+    if (visible) cursorOverlay.classList.add('show');
+    else cursorOverlay.classList.remove('show');
+  }
+
+  function updateCursorPosition(x, y) {
+    cursorX = x;
+    cursorY = y;
+
+    if (!cursorOverlay || !cursorPixel) return;
+
+    const cellWidth = cursorOverlay.clientWidth / GRID_WIDTH;
+    const cellHeight = cursorOverlay.clientHeight / GRID_HEIGHT;
+    const pixelWidth = Math.max(1, Math.floor(cellWidth));
+    const pixelHeight = Math.max(1, Math.floor(cellHeight));
+    const screenX = Math.floor(x * cellWidth);
+    const screenY = Math.floor(y * cellHeight);
+
+    cursorPixel.style.width = pixelWidth + 'px';
+    cursorPixel.style.height = pixelHeight + 'px';
+    cursorPixel.style.transform = 'translate(' + screenX + 'px, ' + screenY + 'px)';
+  }
+
+  function updateCursorVisibility() {
+    const shouldShow = !penDown && cursorX !== null && cursorY !== null;
+    setCursorVisible(shouldShow);
+  }
+
+  function refreshCursorAfterResize() {
+    if (cursorX === null || cursorY === null) return;
+    updateCursorPosition(cursorX, cursorY);
+    updateCursorVisibility();
+  }
+
+  window.addEventListener('resize', refreshCursorAfterResize);
+
+  function renderFrameFromBase64(frame) {
+    if (!frame || frame.format !== '1bpp-msb' || !frame.data) {
+      return;
+    }
+
+    clearCanvas();
+    const bytes = atob(frame.data);
+    const width = Number(frame.width) || GRID_WIDTH;
+    const height = Number(frame.height) || GRID_HEIGHT;
+    const renderWidth = Math.min(width, GRID_WIDTH);
+    const renderHeight = Math.min(height, GRID_HEIGHT);
+
+    for (let y = 0; y < renderHeight; y++) {
+      for (let x = 0; x < renderWidth; x++) {
+        const bitIndex = y * width + x;
+        const byteIndex = bitIndex >> 3;
+        const bitMask = 0x80 >> (bitIndex & 0x07);
+        if (byteIndex < bytes.length && (bytes.charCodeAt(byteIndex) & bitMask)) {
+          setPixel(x, y);
+        }
+      }
+    }
+  }
+
+  function applyStrokeMessage(data) {
+    const x = Math.max(0, Math.min(GRID_WIDTH - 1, Number(data.x) || 0));
+    const y = Math.max(0, Math.min(GRID_HEIGHT - 1, Number(data.y) || 0));
+    const erase = data.erase === true || data.erase === 1;
+
+    if (data.penDown !== undefined) {
+      updatePen(data.penDown === true || data.penDown === 1);
+    }
+
+    if (erase) {
+      clearCanvas();
+    }
+
+    if (penDown) {
+      if (lastX !== null && lastY !== null) {
+        drawLine(lastX, lastY, x, y);
+      } else {
+        setPixel(x, y);
+      }
+    }
+
+    updateCursorPosition(x, y);
+
+    lastX = x;
+    lastY = y;
+    updateCursorVisibility();
   }
 
   // ============================================================
@@ -518,6 +686,16 @@
   const confFill     = document.getElementById('confFill');
   const statusDot    = document.getElementById('statusDot');
   const statusText   = document.getElementById('statusText');
+  const wsIpInput    = document.getElementById('wsIpInput');
+  const connectBtn   = document.getElementById('connectBtn');
+  const simModeToggle = document.getElementById('simModeToggle');
+  const simActions   = document.getElementById('simActions');
+  const simPromptBtn = document.getElementById('simPromptBtn');
+  const simDrawBtn   = document.getElementById('simDrawBtn');
+  const simSubmitCorrectBtn = document.getElementById('simSubmitCorrectBtn');
+  const simSubmitWrongBtn = document.getElementById('simSubmitWrongBtn');
+  const simClearBtn  = document.getElementById('simClearBtn');
+  const simButtons = [simPromptBtn, simDrawBtn, simSubmitCorrectBtn, simSubmitWrongBtn, simClearBtn];
 
   function updatePen(down) {
     penDown = down;
@@ -529,12 +707,19 @@
       penLabel.textContent = 'PEN UP';
       lastX = null; lastY = null; // break the line chain
     }
+
+    updateCursorVisibility();
   }
 
   function showPrompt(word) {
     promptBanner.classList.remove('waiting');
     promptWord.textContent = word;
     resultPanel.classList.remove('show');
+  }
+
+  function showWaitingPrompt() {
+    promptBanner.classList.add('waiting');
+    promptWord.textContent = 'Waiting for prompt...';
   }
 
   function showResult(guess, confidence, correct) {
@@ -562,33 +747,187 @@
     statusText.textContent = msg || (state === 'ok' ? 'Connected' : 'Disconnected');
   }
 
+  function stopHeartbeat() {
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  function startHeartbeat(socket, ip) {
+    stopHeartbeat();
+    lastHeartbeatRxAt = Date.now();
+    heartbeatTimer = setInterval(() => {
+      if (socket !== ws || !socket || socket.readyState !== WebSocket.OPEN) {
+        stopHeartbeat();
+        return;
+      }
+
+      if (Date.now() - lastHeartbeatRxAt > HEARTBEAT_TIMEOUT_MS) {
+        resetViewerSequenceState();
+        ws = null;
+        stopHeartbeat();
+        setStatus('err', 'Disconnected');
+        socket.close();
+        return;
+      }
+
+      try {
+        socket.send(JSON.stringify({ type: 'heartbeat' }));
+      } catch (e) {
+        resetViewerSequenceState();
+        ws = null;
+        stopHeartbeat();
+        setStatus('err', 'Disconnected');
+        socket.close();
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  function resetDisplayState() {
+    appPhase = 'waiting_for_prompt';
+    cursorX = null;
+    cursorY = null;
+    clearCanvas();
+    updatePen(false);
+    setCursorVisible(false);
+    showWaitingPrompt();
+    resultPanel.classList.remove('show');
+  }
+
+  function applyPhaseUi(data) {
+    appPhase = data.phase || appPhase;
+    if (data.hasPrompt && data.prompt) {
+      showPrompt(data.prompt);
+    } else {
+      showWaitingPrompt();
+    }
+
+    if (appPhase === 'result' && data.hasResult && data.result) {
+      showResult(data.result.guess, data.result.confidence, data.result.correct);
+    } else {
+      resultPanel.classList.remove('show');
+    }
+  }
+
+  function applySnapshot(data) {
+    lastSeq = Number(data.seq) || 0;
+    stopSnapshotResyncRetry();
+    renderFrameFromBase64(data.frame);
+    applyPhaseUi(data);
+
+    if (data.cursor && data.cursor.valid) {
+      updatePen(data.cursor.penDown === true || data.cursor.penDown === 1);
+      updateCursorPosition(clampCoord(data.cursor.x, GRID_WIDTH), clampCoord(data.cursor.y, GRID_HEIGHT));
+      updateCursorVisibility();
+    } else {
+      cursorX = null;
+      cursorY = null;
+      updatePen(false);
+      setCursorVisible(false);
+    }
+  }
+
+  function resetViewerSequenceState() {
+    lastSeq = null;
+    stopSnapshotResyncRetry();
+  }
+
+  function requestResync(socket = ws) {
+    if (socket === ws && socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'resync' }));
+    }
+  }
+
+  function stopSnapshotResyncRetry() {
+    if (resyncRetryTimer !== null) {
+      clearTimeout(resyncRetryTimer);
+      resyncRetryTimer = null;
+    }
+  }
+
+  function scheduleSnapshotResyncRetry(socket) {
+    if (resyncRetryTimer !== null) return;
+    resyncRetryTimer = setTimeout(() => {
+      resyncRetryTimer = null;
+      if (socket !== ws || !socket || socket.readyState !== WebSocket.OPEN || lastSeq !== null) {
+        return;
+      }
+      requestResync(socket);
+      scheduleSnapshotResyncRetry(socket);
+    }, RESYNC_RETRY_MS);
+  }
+
+  function startSnapshotResync(socket = ws) {
+    if (socket !== ws || !socket || socket.readyState !== WebSocket.OPEN) return;
+    requestResync(socket);
+    scheduleSnapshotResyncRetry(socket);
+  }
+
+  function ensureSnapshotResync(socket = ws) {
+    if (socket !== ws || !socket || socket.readyState !== WebSocket.OPEN || resyncRetryTimer !== null) {
+      return;
+    }
+    startSnapshotResync(socket);
+  }
+
+  function applyDelta(data) {
+    const baseSeq = Number(data.baseSeq);
+    const nextSeq = Number(data.seq);
+    if (lastSeq === null || baseSeq !== lastSeq || !Array.isArray(data.events)) {
+      lastSeq = null;
+      ensureSnapshotResync();
+      return;
+    }
+
+    for (const event of data.events) {
+      if (!event || !event.kind) continue;
+      if (event.kind === 'clear') {
+        clearCanvas();
+        continue;
+      }
+      if (event.kind === 'line') {
+        drawLine(clampCoord(event.x0, GRID_WIDTH),
+                 clampCoord(event.y0, GRID_HEIGHT),
+                 clampCoord(event.x1, GRID_WIDTH),
+                 clampCoord(event.y1, GRID_HEIGHT));
+        continue;
+      }
+      if (event.kind === 'cursor') {
+        updatePen(event.penDown === true || event.penDown === 1);
+        updateCursorPosition(clampCoord(event.x, GRID_WIDTH), clampCoord(event.y, GRID_HEIGHT));
+        updateCursorVisibility();
+      }
+    }
+
+    lastSeq = nextSeq;
+  }
+
   // ============================================================
   //  HANDLE INCOMING MESSAGE (from WebSocket or simulation)
+  //  stroke/move = real-time viewer path, result/prompt = AI/game state path
   // ============================================================
   function handleMessage(data) {
     /*
       Expected JSON formats:
+        { "type": "snapshot", "seq": 0, "phase": "...", "frame": {...} }
+        { "type": "delta", "baseSeq": 0, "seq": 1, "events": [...] }
+        { "type": "stroke", "x": 0-127, "y": 0-127, "penDown": 0|1, "erase": 0|1 }
         { "type": "move",   "x": 0-127, "y": 0-127, "penDown": bool }
         { "type": "clear" }
         { "type": "result", "guess": "cat", "confidence": 7, "correct": true }
         { "type": "prompt", "word": "bicycle" }
     */
     switch (data.type) {
+      case 'snapshot':
+        applySnapshot(data);
+        break;
+      case 'delta':
+        applyDelta(data);
+        break;
+      case 'stroke':
       case 'move': {
-        const x = Math.max(0, Math.min(GRID - 1, data.x));
-        const y = Math.max(0, Math.min(GRID - 1, data.y));
-
-        if (data.penDown !== undefined) updatePen(data.penDown);
-
-        if (penDown) {
-          if (lastX !== null && lastY !== null) {
-            drawLine(lastX, lastY, x, y);
-          } else {
-            setPixel(x, y);
-          }
-        }
-        lastX = x;
-        lastY = y;
+        applyStrokeMessage(data);
         break;
       }
       case 'clear':
@@ -600,26 +939,59 @@
       case 'prompt':
         showPrompt(data.word);
         break;
+      case 'heartbeat_ack':
+        break;
       default:
         console.warn('Unknown message type:', data.type);
     }
   }
 
   // ============================================================
-  //  WEBSOCKET CONNECTION
-  // ============================================================
-  let ws = null;
+    //  WEBSOCKET CONNECTION
+    // ============================================================
+    let ws = null;
 
-  function connectWS(ip) {
-    if (ws) { ws.close(); ws = null; }
-    const url = 'ws://' + ip + '/ws';
-    setStatus('', 'Connecting to ' + url + '...');
+    function closeCurrentSocket() {
+      resetViewerSequenceState();
+      stopHeartbeat();
+      if (!ws) return;
+      const previousSocket = ws;
+      ws = null;
+      previousSocket.close();
+    }
 
-    ws = new WebSocket(url);
-    ws.onopen = () => setStatus('ok', 'Connected to ' + ip);
-    ws.onclose = () => setStatus('', 'Disconnected');
-    ws.onerror = () => setStatus('err', 'Connection failed');
-    ws.onmessage = (evt) => {
+    function connectWS(ip) {
+      if (simModeEnabled) {
+        setStatus('err', 'Disable local simulation before connecting');
+        return;
+      }
+      closeCurrentSocket();
+      const url = 'ws://' + ip + '/ws';
+      setStatus('', 'Connecting to ' + url + '...');
+
+    const socket = new WebSocket(url, WS_SUBPROTOCOL);
+    ws = socket;
+    socket.onopen = () => {
+      if (socket !== ws) return;
+      resetViewerSequenceState();
+      setStatus('ok', 'Connected to ' + ip);
+      startHeartbeat(socket, ip);
+      startSnapshotResync(socket);
+    };
+    socket.onclose = () => {
+      if (socket !== ws) return;
+      resetViewerSequenceState();
+      stopHeartbeat();
+      ws = null;
+      setStatus('err', 'Disconnected');
+    };
+    socket.onerror = () => {
+      if (socket !== ws) return;
+      setStatus('err', 'Disconnected');
+    };
+    socket.onmessage = (evt) => {
+      if (socket !== ws) return;
+      lastHeartbeatRxAt = Date.now();
       try {
         const data = JSON.parse(evt.data);
         handleMessage(data);
@@ -627,69 +999,225 @@
         console.warn('Bad message:', evt.data, e);
       }
     };
-  }
-
-  document.getElementById('connectBtn').addEventListener('click', () => {
-    const ip = document.getElementById('wsIpInput').value.trim();
-    if (ip) connectWS(ip);
-  });
-
-  // ============================================================
-  //  SIMULATION HELPERS (for testing without ESP32)
-  // ============================================================
-  const sampleWords = ['cat', 'house', 'bicycle', 'tree', 'sun', 'fish', 'car', 'boat', 'star', 'flower'];
-
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  // Simulate drawing a simple shape
-  async function simDraw() {
-    handleMessage({ type: 'clear' });
-    updatePen(true);
-
-    // draw a little star-ish shape in the center
-    const cx = 64, cy = 64, r = 30;
-    const points = [];
-    for (let i = 0; i < 10; i++) {
-      const angle = (Math.PI * 2 * i) / 10 - Math.PI / 2;
-      const dist = i % 2 === 0 ? r : r * 0.45;
-      points.push([
-        Math.round(cx + Math.cos(angle) * dist),
-        Math.round(cy + Math.sin(angle) * dist)
-      ]);
     }
-    points.push(points[0]); // close shape
 
-    for (let i = 0; i < points.length; i++) {
-      handleMessage({ type: 'move', x: points[i][0], y: points[i][1], penDown: true });
-      await sleep(80);
+    connectBtn.addEventListener('click', () => {
+      const ip = wsIpInput.value.trim();
+      if (ip) connectWS(ip);
+    });
+
+    // ============================================================
+    //  SIMULATION HELPERS (for testing without ESP32)
+    // ============================================================
+    const sampleWords = ['cat', 'house', 'bicycle', 'tree', 'sun', 'fish', 'car', 'boat', 'star', 'flower'];
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    function requireSimMode() {
+      if (simModeEnabled) return true;
+      setStatus('err', 'Enable local simulation first');
+      return false;
     }
-    updatePen(false);
-  }
 
-  document.getElementById('simDrawBtn').addEventListener('click', simDraw);
+    function setSimControlsEnabled(enabled) {
+      simActions.hidden = !enabled;
+      simButtons.forEach((button) => {
+        button.disabled = !enabled;
+      });
+      wsIpInput.disabled = enabled;
+      connectBtn.disabled = enabled;
+    }
 
-  document.getElementById('simPromptBtn').addEventListener('click', () => {
-    const w = sampleWords[Math.floor(Math.random() * sampleWords.length)];
-    handleMessage({ type: 'prompt', word: w });
-  });
+    function randomSampleWord(excludeWord = '') {
+      if (sampleWords.length === 0) return 'shape';
+      let word = sampleWords[Math.floor(Math.random() * sampleWords.length)];
+      for (let i = 0; i < 10 && sampleWords.length > 1 && word === excludeWord; i++) {
+        word = sampleWords[Math.floor(Math.random() * sampleWords.length)];
+      }
+      return word;
+    }
 
-  document.getElementById('simSubmitCorrectBtn').addEventListener('click', () => {
-    const w = sampleWords[Math.floor(Math.random() * sampleWords.length)];
-    handleMessage({ type: 'result', guess: w, confidence: 7 + Math.floor(Math.random() * 4), correct: true });
-  });
+    function simFrameBase64() {
+      let raw = '';
+      for (let i = 0; i < simFrame.length; i++) {
+        raw += String.fromCharCode(simFrame[i]);
+      }
+      return btoa(raw);
+    }
 
-  document.getElementById('simSubmitWrongBtn').addEventListener('click', () => {
-    const w = sampleWords[Math.floor(Math.random() * sampleWords.length)];
-    handleMessage({ type: 'result', guess: w, confidence: 1 + Math.floor(Math.random() * 5), correct: false });
-  });
+    function simSetPixel(x, y) {
+      if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return;
+      const bitIndex = y * GRID_WIDTH + x;
+      simFrame[bitIndex >> 3] |= 0x80 >> (bitIndex & 0x07);
+    }
 
-  document.getElementById('simClearBtn').addEventListener('click', () => {
-    handleMessage({ type: 'clear' });
-    resultPanel.classList.remove('show');
-    promptBanner.classList.add('waiting');
-    promptWord.textContent = 'Waiting for prompt...';
-  });
-</script>
+    function simDrawLine(x0, y0, x1, y1) {
+      x0 = clampCoord(x0, GRID_WIDTH);
+      y0 = clampCoord(y0, GRID_HEIGHT);
+      x1 = clampCoord(x1, GRID_WIDTH);
+      y1 = clampCoord(y1, GRID_HEIGHT);
+
+      const dx = Math.abs(x1 - x0);
+      const dy = Math.abs(y1 - y0);
+      const sx = x0 < x1 ? 1 : -1;
+      const sy = y0 < y1 ? 1 : -1;
+      let err = dx - dy;
+
+      while (true) {
+        simSetPixel(x0, y0);
+        if (x0 === x1 && y0 === y1) break;
+        const e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+      }
+    }
+
+    function simApplyEventsToFrame(events) {
+      for (const event of events) {
+        if (!event || !event.kind) continue;
+        if (event.kind === 'clear') {
+          simFrame.fill(0);
+          continue;
+        }
+        if (event.kind === 'line') {
+          simDrawLine(event.x0, event.y0, event.x1, event.y1);
+        }
+      }
+    }
+
+    function simSnapshot(phase, prompt, result) {
+      handleMessage({
+        type: 'snapshot',
+        seq: simSeq,
+        phase,
+        hasPrompt: Boolean(prompt),
+        prompt: prompt || '',
+        cursor: { valid: cursorX !== null && cursorY !== null, x: cursorX || 0, y: cursorY || 0, penDown },
+        frame: { width: GRID_WIDTH, height: GRID_HEIGHT, format: '1bpp-msb', data: simFrameBase64() },
+        hasResult: Boolean(result),
+        result: result || undefined
+      });
+    }
+
+    function simDelta(events) {
+      simApplyEventsToFrame(events);
+      handleMessage({
+        type: 'delta',
+        baseSeq: simSeq,
+        seq: simSeq + 1,
+        events
+      });
+      simSeq += 1;
+    }
+
+    function resetSimState() {
+      simSeq = 0;
+      simPrompt = '';
+      simFrame.fill(0);
+      resetViewerSequenceState();
+      resetDisplayState();
+      simSnapshot('waiting_for_prompt', '', null);
+    }
+
+    function setSimMode(enabled) {
+      if (simModeEnabled === enabled) return;
+      simModeEnabled = enabled;
+      simRunId += 1;
+      simModeToggle.checked = enabled;
+      setSimControlsEnabled(enabled);
+
+      if (enabled) {
+        closeCurrentSocket();
+        resetSimState();
+        setStatus('ok', 'Local simulation mode');
+        return;
+      }
+
+      resetViewerSequenceState();
+      resetDisplayState();
+      setStatus('err', 'Disconnected');
+    }
+
+    function simNewPrompt() {
+      if (!requireSimMode()) return;
+      simRunId += 1;
+      simPrompt = randomSampleWord();
+      simSeq += 1;
+      simSnapshot('drawing', simPrompt, null);
+      setStatus('ok', 'Local simulation mode');
+    }
+
+    async function simDraw() {
+      if (!requireSimMode()) return;
+      simRunId += 1;
+      const runId = simRunId;
+      simDelta([{ kind: 'clear' }, { kind: 'cursor', x: 64, y: 64, penDown: true }]);
+
+      const cx = 64, cy = 64, r = 30;
+      const points = [];
+      for (let i = 0; i < 10; i++) {
+        const angle = (Math.PI * 2 * i) / 10 - Math.PI / 2;
+        const dist = i % 2 === 0 ? r : r * 0.45;
+        points.push([
+          Math.round(cx + Math.cos(angle) * dist),
+          Math.round(cy + Math.sin(angle) * dist)
+        ]);
+      }
+      points.push(points[0]); // close shape
+
+      for (let i = 1; i < points.length; i++) {
+        if (!simModeEnabled || runId !== simRunId) return;
+        simDelta([
+          { kind: 'line', x0: points[i - 1][0], y0: points[i - 1][1], x1: points[i][0], y1: points[i][1] },
+          { kind: 'cursor', x: points[i][0], y: points[i][1], penDown: true }
+        ]);
+        await sleep(80);
+      }
+      if (!simModeEnabled || runId !== simRunId) return;
+      const last = points[points.length - 1];
+      simDelta([{ kind: 'cursor', x: last[0], y: last[1], penDown: false }]);
+    }
+
+    async function simSubmitResult(correct) {
+      if (!requireSimMode()) return;
+      simRunId += 1;
+      const runId = simRunId;
+      const prompt = simPrompt || randomSampleWord();
+      if (!simPrompt) {
+        simPrompt = prompt;
+      }
+
+      simSeq += 1;
+      simSnapshot('guessing', prompt, null);
+      await sleep(500);
+      if (!simModeEnabled || runId !== simRunId) return;
+
+      const guess = correct ? prompt : randomSampleWord(prompt);
+      const confidence = correct ? 7 + Math.floor(Math.random() * 4) : 1 + Math.floor(Math.random() * 5);
+      simSeq += 1;
+      simSnapshot('result', prompt, { guess, confidence, correct });
+    }
+
+    function simClear() {
+      if (!requireSimMode()) return;
+      simRunId += 1;
+      simPrompt = '';
+      simFrame.fill(0);
+      simSeq += 1;
+      resetDisplayState();
+      simSnapshot('waiting_for_prompt', '', null);
+    }
+
+    simModeToggle.addEventListener('change', () => {
+      setSimMode(simModeToggle.checked);
+    });
+    simPromptBtn.addEventListener('click', simNewPrompt);
+    simDrawBtn.addEventListener('click', simDraw);
+    simSubmitCorrectBtn.addEventListener('click', () => simSubmitResult(true));
+    simSubmitWrongBtn.addEventListener('click', () => simSubmitResult(false));
+    simClearBtn.addEventListener('click', simClear);
+    setSimControlsEnabled(false);
+  </script>
 
 </body>
 </html>
